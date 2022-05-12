@@ -1,0 +1,30 @@
+{
+  "name": "eth-indexer",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/main.js",
+  "scripts": {
+    "pretty": "prettier --write src/**/*.js"
+  },
+  "keywords": [],
+  "author": "Tintin Ho <me@tintinho.net>",
+  "private": true,
+  "dependencies": {
+    "@koa/router": "^10.1.1",
+    "bunyan": "^1.8.15",
+    "dotenv": "^16.0.0",
+    "ethers": "^5.6.4",
+    "koa": "^2.13.4",
+    "lodash": "^4.17.21",
+    "pg": "^8.7.3",
+    "sql-bricks-postgres": "^0.5.0",
+    "ulid": "^2.3.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.15",
+    "prettier": "^2.6.2"
+  },
+  "prettier": {
+    "semi": false
+  }
+}
