@@ -11,6 +11,9 @@ const { Pool } = require("pg")
 const sb = require("sql-bricks-postgres")
 const { ulid } = require("ulid")
 
+const IntervalMath = require("./intervals")
+
+
 const logger = bunyan.createLogger({ name: "eth-indexer" })
 logger.level("TRACE")
 
@@ -20,6 +23,9 @@ const syncingUpperLimit = Number(process.env.SYNCING_UPPER_LIMIT || Infinity)
 const syncingStepSize = Number(process.env.SYNCING_STEP_SIZE || 100)
 const syncingWhitelist = parseLogPredicate(process.env.SYNCING_WHITELIST)
 const syncingBlacklist = parseLogPredicate(process.env.SYNCING_BLACKLIST)
+const syncingStrategy = process.env.SYNCING_STRATEGY
+const syncingLockDuration = process.env.SYNCING_LOCK_DURATION
+const instanceId = process.env.INSTANCE_ID
 
 logger.debug("whitelist: %o", syncingWhitelist)
 logger.debug("blacklist: %o", syncingBlacklist)
@@ -73,12 +79,6 @@ function logId({ transactionHash, blockNumber, logIndex }) {
   )
 }
 
-function waitForNewBlock(events) {
-  return new Promise((resolve) => {
-    events.once("block", (b) => resolve(b))
-  })
-}
-
 function combineTopics(row) {
   const { topic0, topic1, topic2, topic3, ...rest } = row
   const topics = [row.topic0, row.topic1, row.topic2, row.topic3].filter(
@@ -116,92 +116,147 @@ async function insertLogs(pool, logs) {
   return mappedLogs.length
 }
 
-async function initializeCheckpoint(pool, provider) {
-  const result = await pool.query("SELECT * FROM checkpoint")
-  if (result.rows.length === 0) {
-    const b = await provider.getBlockNumber()
-
-    await pool.query(
-      `
-      INSERT INTO checkpoint(downloaded_lower_bound, downloaded_upper_bound, published_lower_bound, published_upper_bound)
-      VALUES ($1, $2, $3, $4)
-    `,
-      [b - 1, b, b - 1, b]
-    )
-    logger.info("initialized the checkpoint to block", b)
+function pickRangeByStretegy(ranges, strategy) {
+  if (strategy === "FROM_EARLIEST") {
+    const r = ranges[0]
+    return { start: r.start, end: Math.min(r.end, r.start + syncingStepSize) }
+  } else if (strategy === "FROM_LATEST") {
+    const r = ranges[ranges.length - 1]
+    return { start: Math.max(r.start, r.end - syncingStepSize), end: r.end }
+  } else {
+    throw new Error("invalid strategy")
   }
 }
 
-async function syncBackward(pool, provider) {
-  while (true) {
-    const rows = extractRows(
-      await pool.query("SELECT downloaded_lower_bound FROM checkpoint")
-    )
-    const lowerBound = rows[0].downloadedLowerBound
-
-    if (lowerBound < syncingLowerLimit) {
-      logger.info("backward syncing completed")
-      return
-    }
-
-    const fromBlock = Math.max(lowerBound - syncingStepSize, syncingLowerLimit)
-    const toBlock = lowerBound
-    const newLowerBound = fromBlock - 1
-
-    console.time(`download logs ${fromBlock} to ${toBlock}`)
-    const logs = await provider.getLogs({ fromBlock, toBlock })
-    console.timeEnd(`download logs ${fromBlock} to ${toBlock}`)
-
-    const c = await insertLogs(pool, logs)
-    logger.info(
-      `downloaded ${logs.length} log entries from block ${fromBlock} to ${toBlock} (${logs.length - c} log entries ignored)`
-    )
-
-    await pool.query("UPDATE checkpoint SET downloaded_lower_bound = $1", [
-      newLowerBound,
-    ])
-  }
+function rangesFromRows(rows) {
+  return rows
+    .map(it => ({ start: it.from_block, end: it.to_block }))
+    .reduce((acc, it) => IntervalMath.union(acc, [it]), [])
 }
 
-async function syncForward(pool, provider, events) {
-  let blockHeight = await provider.getBlockNumber()
+async function getUnavailableRanges(client) {
+  const result = await client.query(`
+    SELECT from_block, to_block FROM completed_range
+    UNION
+    SELECT from_block, to_block FROM locked_range
+  `)
 
+  return rangesFromRows(result.rows)
+}
+
+async function pickWorkingRange(pool, listener) {
   while (true) {
-    const rows = extractRows(
-      await pool.query("SELECT downloaded_upper_bound FROM checkpoint")
-    )
-    const upperBound = rows[0].downloadedUpperBound
+    const fullRanges = [{ start: syncingLowerLimit, end: Math.min(listener.block, syncingUpperLimit) }]
+    const unavailableRanges = await getUnavailableRanges(pool)
+    const availableRanges = IntervalMath.difference(fullRanges, unavailableRanges)
+    logger.trace("pick working range %o : %o : %o", fullRanges, unavailableRanges, availableRanges)
 
-    if (upperBound > syncingUpperLimit) {
-      logger.info("forward syncing completed")
-      return
-    }
-
-    if (upperBound > blockHeight) {
-      logger.debug("reach current block height, waiting for new block")
-      blockHeight = await waitForNewBlock(events)
+    if (availableRanges.length === 0) {
+      await listener.wait()
       continue
     }
 
-    const fromBlock = upperBound
-    const toBlock = Math.min(
-      upperBound + syncingStepSize,
-      Math.min(blockHeight, syncingUpperLimit)
-    )
-    const newUpperBound = toBlock + 1
+    return pickRangeByStretegy(availableRanges, syncingStrategy)
+  }
+}
 
-    console.time(`download logs ${fromBlock} to ${toBlock}`)
-    const logs = await provider.getLogs({ fromBlock, toBlock })
-    console.timeEnd(`download logs ${fromBlock} to ${toBlock}`)
+async function acquireLock(pool, range) {
+  const client = await pool.connect()
 
-    const c = await insertLogs(pool, logs)
-    logger.info(
-      `downloaded ${logs.length} log entries from block ${fromBlock} to ${toBlock} (${logs.length - c} log entries ignored)`
-    )
+  try {
+    await client.query("BEGIN")
+    await client.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
 
-    await pool.query("UPDATE checkpoint SET downloaded_upper_bound = $1", [
-      newUpperBound,
-    ])
+    const unavailableRanges = await getUnavailableRanges(client)
+    const isOverlapFree = unavailableRanges.every(it => !IntervalMath.isOverlap(it, range))
+    if (!isOverlapFree) {
+      await client.query("ROLLBACK")
+      logger.warn("failed to acquire lock because of overlapping")
+      return false
+    }
+
+    await client.query(`
+      INSERT INTO locked_range(instance_id, created_at, expires_at, from_block, to_block)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [instanceId, new Date(), new Date(new Date() + syncingLockDuration * 1000), range.start, range.end])
+    
+    await client.query("COMMIT")
+    return true
+
+  } catch (e) {
+    await client.query("ROLLBACK")
+    logger.warn(e, "acquire a range lock failed")
+    return false
+
+  } finally {
+    client.release()
+  }
+}
+
+async function updateCheckpoint(pool, range) {
+  const client = await pool.connect()
+
+  try {
+    await client.query("BEGIN")
+    await client.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+
+    const result = await client.query("SELECT from_block, to_block FROM completed_range")
+    const completedRanges = rangesFromRows(result.rows)
+    const newCompletedRanges = IntervalMath.union(completedRanges, [range])
+
+    await client.query("DELETE FROM completed_range")
+    for (const r of newCompletedRanges) {
+      await client.query(`
+        INSERT INTO completed_range(from_block, to_block)
+        VALUES ($1, $2)
+      `, [r.start, r.end])
+    }
+
+    await client.query("COMMIT")
+  } catch (e) {
+    await client.query("ROLLBACK")
+    throw e
+
+  } finally {
+    client.release()
+  }
+}
+
+async function fetchAndSaveLogs(pool, provider, fromBlock, toBlock) {
+  console.time(`download logs ${fromBlock} to ${toBlock}`)
+  const logs = await provider.getLogs({ fromBlock, toBlock })
+  console.timeEnd(`download logs ${fromBlock} to ${toBlock}`)
+
+  const c = await insertLogs(pool, logs)
+  logger.info(
+    `downloaded ${logs.length} log entries from block ${fromBlock} to ${toBlock} (${logs.length - c} log entries ignored)`
+  )
+}
+
+async function releaseLock(pool) {
+  const result = await pool.query("DELETE FROM locked_range WHERE instance_id = $1", [instanceId])
+  if (result.rowCount > 0) {
+    logger.debug("range lock released")
+  }
+}
+
+async function mainloop(pool, provider, listener) {
+  await listener.initialize()
+
+  while (true) {
+    await releaseLock(pool)
+
+    const range = await pickWorkingRange(pool, listener)
+    logger.trace("picked working range %o", range)
+
+    const success = await acquireLock(pool, range)
+    if (!success) continue
+    logger.debug("range lock acquired %o", range)
+
+    await fetchAndSaveLogs(pool, provider, range.start, range.end)
+    await updateCheckpoint(pool, range)
+
+    await releaseLock(pool)
   }
 }
 
@@ -251,6 +306,35 @@ async function startHttpServer(pool) {
   )
 }
 
+class BlockListener {
+
+  constructor(provider) {
+    this.provider = provider
+    this.block = -1
+    this.events = new EventEmitter()
+
+    this.provider.on("block", (b) => {
+      this.block = b
+      logger.trace("block mined %s", b)
+      this.events.emit("block")
+    })
+  }
+
+  wait(timeout = 30_000) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, timeout)
+      this.events.once("block", resolve)
+    })
+  }
+
+  async initialize() {
+    if (this.block === -1) {
+      await this.wait()
+    }
+  }
+
+}
+
 async function main() {
   logger.info("service eth-indexer is starting")
   logger.info(`syncing from ${syncingLowerLimit} to ${syncingUpperLimit}`)
@@ -259,26 +343,14 @@ async function main() {
   const httpProvider = new ethers.providers.JsonRpcProvider(
     process.env.NODE_RPC_HTTP_ENDPOINT
   )
-  const wsProvider = new ethers.providers.WebSocketProvider(
+  const websocketProvider = new ethers.providers.WebSocketProvider(
     process.env.NODE_RPC_WEBSOCKET_ENDPOINT
   )
-  const events = new EventEmitter()
-
-  wsProvider.on("block", (b) => {
-    logger.trace("got block event", b)
-    events.emit("block", b)
-  })
-
-  await initializeCheckpoint(pool, httpProvider)
-
-  logger.trace("eth-indexer initialized")
+  const listener = new BlockListener(websocketProvider)
 
   startHttpServer(pool)
 
-  await Promise.all([
-    syncForward(pool, httpProvider, events),
-    syncBackward(pool, httpProvider),
-  ])
+  await mainloop(pool, httpProvider, listener)
 }
 
 main().catch((e) => {

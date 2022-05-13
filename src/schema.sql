@@ -18,10 +18,20 @@ CREATE TABLE log(
 
 CREATE INDEX address_idx ON log(address);
 
-CREATE TABLE checkpoint(
-  lock BOOLEAN PRIMARY KEY DEFAULT (TRUE) CHECK (lock = TRUE),
-  downloaded_lower_bound INTEGER NOT NULL,
-  downloaded_upper_bound INTEGER NOT NULL,
-  published_lower_bound INTEGER NOT NULL,
-  published_upper_bound INTEGER NOT NULL
+CREATE TABLE completed_range(
+  from_block INTEGER NOT NULL,
+  to_block INTEGER NOT NULL,
+
+  CHECK (from_block <= to_block),
+  PRIMARY KEY (from_block, to_block)
+);
+
+CREATE TABLE locked_range(
+  instance_id TEXT PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  from_block INTEGER NOT NULL,
+  to_block INTEGER NOT NULL,
+
+  CHECK (from_block <= to_block)
 );
